@@ -68,8 +68,24 @@ def get_redis_connection(config, use_strict_redis=False):
     """
     redis_cls = redis.StrictRedis if use_strict_redis else redis.Redis
 
+    if use_strict_redis:
+        connection_cache_key = '_CONNECTION_STRICT'
+    else:
+        connection_cache_key = '_CONNECTION_NORMAL'
+
+    try:
+        return config[connection_cache_key]
+    except KeyError:
+        pass
+
+    def _setup_connection_cache(x):
+        config[connection_cache_key] = x
+        return x
+
     if 'URL' in config:
-        return redis_cls.from_url(config['URL'], db=config.get('DB'))
+        return _setup_connection_cache(
+                redis_cls.from_url(config['URL'], db=config.get('DB')))
+
     if 'USE_REDIS_CACHE' in config.keys():
 
         try:
@@ -88,23 +104,26 @@ def get_redis_connection(config, use_strict_redis=False):
                 # we need to use cache.client.get_client() instead of
                 # cache.client.client used in older versions
                 try:
-                    return cache.client.get_client()
+                    return _setup_connection_cache(cache.client.get_client())
                 except AttributeError:
-                    return cache.client.client
+                    return _setup_connection_cache(cache.client.client)
             except NotImplementedError:
                 pass
         else:
             # We're using django-redis-cache
             try:
-                return cache._client
+                return _setup_connection_cache(cache._client)
             except AttributeError:
                 # For django-redis-cache > 0.13.1
-                return cache.get_master_client()
+                return _setup_connection_cache(cache.get_master_client())
 
     if 'UNIX_SOCKET_PATH' in config:
-        return redis_cls(unix_socket_path=config['UNIX_SOCKET_PATH'], db=config['DB'])
+        return _setup_connection_cache(redis_cls(
+                unix_socket_path=config['UNIX_SOCKET_PATH'], db=config['DB']))
 
-    return redis_cls(host=config['HOST'], port=config['PORT'], db=config['DB'], password=config.get('PASSWORD', None))
+    return _setup_connection_cache(redis_cls(
+        host=config['HOST'], port=config['PORT'], db=config['DB'],
+        password=config.get('PASSWORD', None)))
 
 
 def get_connection(name='default', use_strict_redis=False):
@@ -168,7 +187,8 @@ def filter_connection_params(queue_params):
     """
     Filters the queue params to keep only the connection related params.
     """
-    NON_CONNECTION_PARAMS = ('DEFAULT_TIMEOUT',)
+    NON_CONNECTION_PARAMS = (
+            'DEFAULT_TIMEOUT', '_CONNECTION_NORMAL', '_CONNECTION_STRICT')
 
     #return {p:v for p,v in queue_params.items() if p not in NON_CONNECTION_PARAMS}
     # Dict comprehension compatible with python 2.6
