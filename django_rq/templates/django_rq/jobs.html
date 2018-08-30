@@ -71,6 +71,8 @@
                             <th><div class = 'text'><span>Enqueued</span></div></th>
                             <th><div class = 'text'><span>Status</span></div></th>
                             <th><div class = 'text'><span>Callable</span></div></th>
+                            {% block extra_columns %}
+                            {% endblock extra_columns %}
                         </tr>
                     </thead>
                     <tbody>
@@ -84,10 +86,20 @@
                                         {{ job.id }}
                                     </a>
                                 </th>
-                                <td>{{ job.created_at|to_localtime }}</td>
-                                <td>{{ job.enqueued_at|to_localtime }}</td>
+                                <td>
+                                    {% if job.created_at %}
+                                        {{ job.created_at|to_localtime|date:"Y-m-d, H:i:s" }}
+                                    {% endif %}
+                                </td>
+                                <td>
+                                    {% if job.enqueued_at %}
+                                        {{ job.enqueued_at|to_localtime|date:"Y-m-d, H:i:s" }}
+                                    {% endif %}
+                                </td>
                                 <td>{{ job.get_status }}</td>
-                                <td>{{ job.func_name }}</td>
+                                <td>{{ job|show_func_name }}</td>
+                                {% block extra_columns_values %}
+                                {% endblock extra_columns_values %}
                             </tr>
                         {% endfor %}
                     </tbody>

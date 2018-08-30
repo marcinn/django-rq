@@ -1,20 +1,17 @@
-from distutils.version import LooseVersion
-import os
-import importlib
 import logging
+import os
 import sys
-
-from django.core.management.base import BaseCommand
-from django.db import connections
-from django.utils.version import get_version
-
-from django_rq.queues import get_queues
-from django_rq.workers import get_exception_handlers
+from distutils.version import LooseVersion
 
 from redis.exceptions import ConnectionError
 from rq import use_connection
 from rq.utils import ColorizingStreamHandler
 
+from django.conf import settings
+from django.core.management.base import BaseCommand
+from django.db import connections
+from django.utils.version import get_version
+from django_rq.workers import get_worker
 
 # Setup logging for RQWorker if not already configured
 logger = logging.getLogger('rq.worker')
@@ -25,14 +22,6 @@ if not logger.handlers:
     handler = ColorizingStreamHandler()
     handler.setFormatter(formatter)
     logger.addHandler(handler)
-
-
-# Copied from rq.utils
-def import_attribute(name):
-    """Return an attribute from a dotted path name (e.g. "path.to.func")."""
-    module_name, attribute = name.rsplit('.', 1)
-    module = importlib.import_module(module_name)
-    return getattr(module, attribute)
 
 
 def reset_db_connections():
@@ -53,7 +42,7 @@ class Command(BaseCommand):
 
     def add_arguments(self, parser):
         parser.add_argument('--worker-class', action='store', dest='worker_class',
-                            default='rq.Worker', help='RQ Worker class to use')
+                            help='RQ Worker class to use')
         parser.add_argument('--pid', action='store', dest='pid',
                             default=None, help='PID file to write the worker`s pid into')
         parser.add_argument('--burst', action='store_true', dest='burst',
@@ -61,10 +50,15 @@ class Command(BaseCommand):
         parser.add_argument('--name', action='store', dest='name',
                             default=None, help='Name of the worker')
         parser.add_argument('--queue-class', action='store', dest='queue_class',
-                            default='django_rq.queues.DjangoRQ', help='Queues class to use')
+                            help='Queues class to use')
+        parser.add_argument('--job-class', action='store', dest='job_class',
+                            help='Jobs class to use')
         parser.add_argument('--worker-ttl', action='store', type=int,
                             dest='worker_ttl', default=420,
                             help='Default worker timeout to be used')
+        parser.add_argument('--sentry-dsn', action='store', default=None, dest='sentry-dsn',
+                            help='Report exceptions to this Sentry DSN')
+
         if LooseVersion(get_version()) >= LooseVersion('1.10'):
             parser.add_argument('args', nargs='*', type=str,
                                 help='The queues to work on, separated by space')
@@ -74,25 +68,37 @@ class Command(BaseCommand):
         if pid:
             with open(os.path.expanduser(pid), "w") as fp:
                 fp.write(str(os.getpid()))
-
+        sentry_dsn = options.get('sentry-dsn') or getattr(settings, 'SENTRY_DSN', None)
         try:
             # Instantiate a worker
-            worker_class = import_attribute(options['worker_class'])
-            queues = get_queues(*args, queue_class=import_attribute(options['queue_class']))
-            w = worker_class(
-                queues,
-                connection=queues[0].connection,
-                name=options['name'],
-                exception_handlers=get_exception_handlers() or None,
-                default_worker_ttl=options['worker_ttl']
-            )
+            worker_kwargs = {
+                'worker_class': options['worker_class'],
+                'queue_class': options['queue_class'],
+                'job_class': options['job_class'],
+                'name': options['name'],
+                'default_worker_ttl': options['worker_ttl'],
+            }
+            w = get_worker(*args, **worker_kwargs)
 
             # Call use_connection to push the redis connection into LocalStack
             # without this, jobs using RQ's get_current_job() will fail
             use_connection(w.connection)
             # Close any opened DB connection before any fork
             reset_db_connections()
+
+            if sentry_dsn:
+                try:
+                    from raven import Client
+                    from raven.transport.http import HTTPTransport
+                    from rq.contrib.sentry import register_sentry
+                    client = Client(sentry_dsn, transport=HTTPTransport)
+                    register_sentry(client, w)
+                except ImportError:
+                    self.stdout.write(self.style.ERROR("Please install sentry. For example `pip install raven`"))
+                    sys.exit(1)
+
             w.work(burst=options.get('burst', False))
         except ConnectionError as e:
             print(e)
             sys.exit(1)
+

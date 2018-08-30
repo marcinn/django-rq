@@ -1,32 +1,33 @@
-from django.contrib.auth.models import User
+import time
+from unittest import skipIf
+
 from django.core.management import call_command
-from django.core.urlresolvers import reverse
-from django.test import TestCase
+from django.test import TestCase, override_settings
+
 try:
-    from unittest import skipIf
+    from django.urls import reverse
 except ImportError:
-    from django.utils.unittest import skipIf
-from django.test.client import Client
-try:
-    from django.test import override_settings
-except ImportError:
-    from django.test.utils import override_settings
+    from django.core.urlresolvers import reverse
+
 from django.conf import settings
 
+from mock import patch, PropertyMock, MagicMock
 from rq import get_current_job, Queue
 from rq.job import Job
-from rq.registry import (DeferredJobRegistry, FinishedJobRegistry,
-                         StartedJobRegistry)
+from rq.registry import FinishedJobRegistry
+from rq.worker import Worker
 
 from django_rq.decorators import job
+from django_rq.jobs import get_job_class
 from django_rq.queues import (
-    get_connection, get_queue, get_queue_by_index, get_queues,
+    get_connection, get_queue, get_queues,
     get_unique_connection_configs, DjangoRQ
 )
 from django_rq import thread_queue
 from django_rq.templatetags.django_rq import to_localtime
-from django_rq.workers import get_worker
-
+from django_rq.tests.fixtures import DummyJob, DummyQueue, DummyWorker
+from django_rq.workers import (get_worker, get_worker_class,
+                               collect_workers_by_connection)
 
 try:
     from rq_scheduler import Scheduler
@@ -46,36 +47,31 @@ def divide(a, b):
     return a / b
 
 
-def get_failed_queue_index(name='default'):
-    """
-    Returns the position of FailedQueue for the named queue in QUEUES_LIST
-    """
-    # Get the index of FailedQueue for 'default' Queue in QUEUES_LIST
-    queue_index = None
-    connection = get_connection(name)
-    connection_kwargs = connection.connection_pool.connection_kwargs
-    for i in range(0, 100):
-        q = get_queue_by_index(i)
-        if q.name == 'failed' and q.connection.connection_pool.connection_kwargs == connection_kwargs:
-            queue_index = i
-            break
-
-    return queue_index
+def long_running_job(timeout=10):
+    time.sleep(timeout)
+    return 'Done sleeping...'
 
 
-def get_queue_index(name='default'):
-    """
-    Returns the position of Queue for the named queue in QUEUES_LIST
-    """
-    queue_index = None
-    connection = get_connection(name)
-    connection_kwargs = connection.connection_pool.connection_kwargs
-    for i in range(0, 100):
-        q = get_queue_by_index(i)
-        if q.name == name and q.connection.connection_pool.connection_kwargs == connection_kwargs:
-            queue_index = i
-            break
-    return queue_index
+class RqstatsTest(TestCase):
+
+    def test_get_connection_default(self):
+        """
+        Test that rqstats returns the right statistics
+        """
+        # Override testing RQ_QUEUES
+        queues = [{
+            'connection_config': {
+                'DB': 0,
+                'HOST': 'localhost',
+                'PORT': 6379,
+            },
+            'name': 'default'
+        }]
+        with patch('django_rq.utils.QUEUES_LIST', new_callable=PropertyMock(return_value=queues)):
+            # Only to make sure it doesn't crash
+            call_command('rqstats')
+            call_command('rqstats', '-j')
+            call_command('rqstats', '-y')
 
 
 @override_settings(RQ={'AUTOCOMMIT': True})
@@ -104,6 +100,32 @@ class QueuesTest(TestCase):
         self.assertEqual(connection_kwargs['host'], config['HOST'])
         self.assertEqual(connection_kwargs['port'], config['PORT'])
         self.assertEqual(connection_kwargs['db'], config['DB'])
+
+    @patch('django_rq.queues.Sentinel')
+    def test_get_connection_sentinel(self, sentinel_class_mock):
+        """
+        Test that get_connection returns the right connection based for
+        `sentinel` queue.
+        """
+        sentinel_mock = MagicMock()
+        sentinel_mock.master_for.return_value = sentinel_mock
+        sentinel_class_mock.side_effect = [sentinel_mock]
+
+        config = QUEUES['sentinel']
+        connection = get_connection('sentinel')
+
+        self.assertEqual(connection, sentinel_mock)
+        sentinel_class_mock.assert_called_once()
+        sentinel_mock.master_for.assert_called_once()
+
+        sentinel_instances = sentinel_class_mock.call_args[0][0]
+        self.assertListEqual(config['SENTINELS'], sentinel_instances)
+
+        connection_kwargs = sentinel_mock.master_for.call_args[1]
+        self.assertEqual(connection_kwargs['service_name'], config['MASTER_NAME'])
+        self.assertEqual(connection_kwargs['db'], config['DB'])
+        self.assertEqual(connection_kwargs['password'], config['PASSWORD'])
+        self.assertEqual(connection_kwargs['socket_timeout'], config['SOCKET_TIMEOUT'])
 
     def test_get_queue_default(self):
         """
@@ -188,6 +210,13 @@ class QueuesTest(TestCase):
         """
         self.assertRaises(ValueError, get_queues, 'default', 'test')
 
+    def test_get_queues_different_classes(self):
+        """
+        Checks that getting queues with different classes (defined in configuration)
+        raises an exception.
+        """
+        self.assertRaises(ValueError, get_queues, 'test', 'test1')
+
     def test_pass_queue_via_commandline_args(self):
         """
         Checks that passing queues via commandline arguments works
@@ -266,17 +295,24 @@ class QueuesTest(TestCase):
         """
         Checks whether asynchronous settings work
         """
-        # Make sure async is not set by default
+        # Make sure is_async is not set by default
         default_queue = get_queue('default')
-        self.assertTrue(default_queue._async)
+        self.assertTrue(default_queue._is_async)
 
-        # Make sure async override works
-        default_queue_async = get_queue('default', async=False)
-        self.assertFalse(default_queue_async._async)
+        # Make sure is_async override works
+        default_queue_is_async = get_queue('default', is_async=False)
+        self.assertFalse(default_queue_is_async._is_async)
 
-        # Make sure async setting works
+        # Make sure old keyword argument 'async' works for backwards
+        # compatibility with code expecting older versions of rq or django-rq.
+        # Note 'async' is a reserved keyword in Python >= 3.7.
+        kwargs = {'async': False}
+        default_queue_async = get_queue('default', **kwargs)
+        self.assertFalse(default_queue_async._is_async)
+
+        # Make sure is_async setting works
         async_queue = get_queue('async')
-        self.assertFalse(async_queue._async)
+        self.assertFalse(async_queue._is_async)
 
     @override_settings(RQ={'AUTOCOMMIT': False})
     def test_autocommit(self):
@@ -312,6 +348,7 @@ class DecoratorTest(TestCase):
         # Ensure that decorator passes in the right queue from settings.py
         queue_name = 'test3'
         config = QUEUES[queue_name]
+
         @job(queue_name)
         def test():
             pass
@@ -329,6 +366,24 @@ class DecoratorTest(TestCase):
         self.assertEqual(result.origin, 'default')
         result.delete()
 
+    def test_job_decorator_result_ttl_default(self):
+        from rq.defaults import DEFAULT_RESULT_TTL
+
+        @job
+        def test():
+            pass
+        result = test.delay()
+        self.assertEqual(result.result_ttl, DEFAULT_RESULT_TTL)
+        result.delete()
+
+    @override_settings(RQ={'AUTOCOMMIT': True, 'DEFAULT_RESULT_TTL': 5432})
+    def test_job_decorator_result_ttl(self):
+        @job
+        def test():
+            pass
+        result = test.delay()
+        self.assertEqual(result.result_ttl, 5432)
+        result.delete()
 
 @override_settings(RQ={'AUTOCOMMIT': True})
 class WorkersTest(TestCase):
@@ -350,6 +405,15 @@ class WorkersTest(TestCase):
         queue = w.queues[0]
         self.assertEqual(queue.name, 'test')
 
+    def test_get_worker_custom_classes(self):
+        w = get_worker('test',
+                       job_class='django_rq.tests.fixtures.DummyJob',
+                       queue_class='django_rq.tests.fixtures.DummyQueue',
+                       worker_class='django_rq.tests.fixtures.DummyWorker')
+        self.assertIs(w.job_class, DummyJob)
+        self.assertIsInstance(w.queues[0], DummyQueue)
+        self.assertIsInstance(w, DummyWorker)
+
     def test_get_current_job(self):
         """
         Ensure that functions using RQ's ``get_current_job`` doesn't fail
@@ -362,149 +426,14 @@ class WorkersTest(TestCase):
         self.assertFalse(job.id in failed_queue.job_ids)
         job.delete()
 
-
-@override_settings(RQ={'AUTOCOMMIT': True})
-class ViewTest(TestCase):
-
-    def setUp(self):
-        user = User.objects.create_user('foo', password='pass')
-        user.is_staff = True
-        user.is_active = True
-        user.save()
-        self.client = Client()
-        self.client.login(username=user.username, password='pass')
-        get_queue('django_rq_test').connection.flushall()
-
-    def test_requeue_job(self):
-        """
-        Ensure that a failed job gets requeued when rq_requeue_job is called
-        """
-        def failing_job():
-            raise ValueError
-
-        queue = get_queue('default')
-        queue_index = get_failed_queue_index('default')
-        job = queue.enqueue(failing_job)
-        worker = get_worker('default')
-        worker.work(burst=True)
-        job.refresh()
-        self.assertTrue(job.is_failed)
-        self.client.post(reverse('rq_requeue_job', args=[queue_index, job.id]),
-                         {'requeue': 'Requeue'})
-        self.assertIn(job, queue.jobs)
-        job.delete()
-
-    def test_delete_job(self):
-        """
-        In addition to deleting job from Redis, the job id also needs to be
-        deleted from Queue.
-        """
-        queue = get_queue('django_rq_test')
-        queue_index = get_queue_index('django_rq_test')
-        job = queue.enqueue(access_self)
-        self.client.post(reverse('rq_delete_job', args=[queue_index, job.id]),
-                         {'post': 'yes'})
-        self.assertFalse(Job.exists(job.id, connection=queue.connection))
-        self.assertNotIn(job.id, queue.job_ids)
-
-    def test_action_delete_jobs(self):
-        queue = get_queue('django_rq_test')
-        queue_index = get_queue_index('django_rq_test')
-
-        # enqueue some jobs
-        job_ids = []
-        for _ in range(0, 3):
-            job = queue.enqueue(access_self)
-            job_ids.append(job.id)
-
-        # remove those jobs using view
-        self.client.post(reverse('rq_actions', args=[queue_index]),
-                         {'action': 'delete', 'job_ids': job_ids})
-
-        # check if jobs are removed
-        for job_id in job_ids:
-            self.assertFalse(Job.exists(job_id, connection=queue.connection))
-            self.assertNotIn(job_id, queue.job_ids)
-
-    def test_action_requeue_jobs(self):
-        def failing_job():
-            raise ValueError
-
-        queue = get_queue('django_rq_test')
-        failed_queue_index = get_failed_queue_index('django_rq_test')
-
-        # enqueue some jobs that will fail
-        jobs = []
-        job_ids = []
-        for _ in range(0, 3):
-            job = queue.enqueue(failing_job)
-            jobs.append(job)
-            job_ids.append(job.id)
-
-        # do those jobs = fail them
-        worker = get_worker('django_rq_test')
-        worker.work(burst=True)
-
-        # check if all jobs are really failed
-        for job in jobs:
-            self.assertTrue(job.is_failed)
-
-        # renqueue failed jobs from failed queue
-        self.client.post(reverse('rq_actions', args=[failed_queue_index]),
-                         {'action': 'requeue', 'job_ids': job_ids})
-
-        # check if we requeue all failed jobs
-        for job in jobs:
-            self.assertFalse(job.is_failed)
-
-    def test_clear_queue(self):
-        """Test that the queue clear actually clears the queue."""
-        queue = get_queue('django_rq_test')
-        queue_index = get_queue_index('django_rq_test')
-        job = queue.enqueue(access_self)
-        self.client.post(reverse('rq_clear', args=[queue_index]),
-                         {'post': 'yes'})
-        self.assertFalse(Job.exists(job.id, connection=queue.connection))
-        self.assertNotIn(job.id, queue.job_ids)
-
-    def test_finished_jobs(self):
-        """Ensure that finished jobs page works properly."""
-        queue = get_queue('django_rq_test')
-        queue_index = get_queue_index('django_rq_test')
-
-        job = queue.enqueue(access_self)
-        registry = FinishedJobRegistry(queue.name, queue.connection)
-        registry.add(job, 2)
-        response = self.client.get(
-            reverse('rq_finished_jobs', args=[queue_index])
-        )
-        self.assertEqual(response.context['jobs'], [job])
-
-    def test_started_jobs(self):
-        """Ensure that active jobs page works properly."""
-        queue = get_queue('django_rq_test')
-        queue_index = get_queue_index('django_rq_test')
-
-        job = queue.enqueue(access_self)
-        registry = StartedJobRegistry(queue.name, queue.connection)
-        registry.add(job, 2)
-        response = self.client.get(
-            reverse('rq_started_jobs', args=[queue_index])
-        )
-        self.assertEqual(response.context['jobs'], [job])
-
-    def test_deferred_jobs(self):
-        """Ensure that active jobs page works properly."""
-        queue = get_queue('django_rq_test')
-        queue_index = get_queue_index('django_rq_test')
-
-        job = queue.enqueue(access_self)
-        registry = DeferredJobRegistry(queue.name, queue.connection)
-        registry.add(job, 2)
-        response = self.client.get(
-            reverse('rq_deferred_jobs', args=[queue_index])
-        )
-        self.assertEqual(response.context['jobs'], [job])
+    def test_collects_worker_various_connections_get_multiple_collection(self):
+        queues = [
+            {'name': 'default', 'connection_config': settings.RQ_QUEUES['default']},
+            {'name': 'django_rq_test', 'connection_config': settings.RQ_QUEUES['django_rq_test']},
+            {'name': 'test3', 'connection_config': settings.RQ_QUEUES['test3']},
+        ]
+        collections = collect_workers_by_connection(queues)
+        self.assertEqual(len(collections), 2)
 
 
 class ThreadQueueTest(TestCase):
@@ -640,8 +569,22 @@ class RedisCacheTest(TestCase):
         self.assertEqual(connection_kwargs['password'], None)
 
 
-class DummyQueue(DjangoRQ):
-    """Just Fake class for the following test"""
+class JobClassTest(TestCase):
+
+    def test_default_job_class(self):
+        job_class = get_job_class()
+        self.assertIs(job_class, Job)
+
+    @override_settings(RQ={'JOB_CLASS': 'django_rq.tests.fixtures.DummyJob'})
+    def test_custom_class(self):
+        job_class = get_job_class()
+        self.assertIs(job_class, DummyJob)
+
+    def test_local_override(self):
+        self.assertIs(
+            get_job_class('django_rq.tests.fixtures.DummyJob'),
+            DummyJob
+        )
 
 
 class QueueClassTest(TestCase):
@@ -657,6 +600,24 @@ class QueueClassTest(TestCase):
     def test_in_kwargs(self):
         queue = get_queue('test', queue_class=DummyQueue)
         self.assertIsInstance(queue, DummyQueue)
+
+
+class WorkerClassTest(TestCase):
+
+    def test_default_worker_class(self):
+        worker = get_worker('test')
+        self.assertIsInstance(worker, Worker)
+
+    @override_settings(RQ={'WORKER_CLASS': 'django_rq.tests.fixtures.DummyWorker'})
+    def test_custom_class(self):
+        worker = get_worker('test')
+        self.assertIsInstance(worker, DummyWorker)
+
+    def test_local_override(self):
+        self.assertIs(
+            get_worker_class('django_rq.tests.fixtures.DummyWorker'),
+            DummyWorker
+        )
 
 
 @override_settings(RQ={'AUTOCOMMIT': True})

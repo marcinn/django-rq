@@ -106,12 +106,19 @@ RQ_QUEUES = {
         'PORT': 1,
         'DB': 1,
     },
+    'sentinel': {
+        'SENTINELS': [(REDIS_HOST, 26736), (REDIS_HOST, 26737)],
+        'MASTER_NAME': 'testmaster',
+        'DB': 1,
+        'PASSWORD': 'secret',
+        'SOCKET_TIMEOUT': 10,
+    },
     'test1': {
         'HOST': REDIS_HOST,
         'PORT': 1,
         'DB': 1,
         'DEFAULT_TIMEOUT': 400,
-        'QUEUE_CLASS': 'django_rq.tests.DummyQueue'
+        'QUEUE_CLASS': 'django_rq.tests.fixtures.DummyQueue'
     },
     'test2': {
         'HOST': REDIS_HOST,
@@ -184,12 +191,14 @@ TEMPLATES = [
 ]
 
 
-MIDDLEWARE_CLASSES = (
+MIDDLEWARE = (
     'django.middleware.common.CommonMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.contrib.auth.middleware.AuthenticationMiddleware',
     'django.contrib.messages.middleware.MessageMiddleware',
 )
+
+MIDDLEWARE_CLASSES = MIDDLEWARE
 
 AUTHENTICATION_BACKENDS = (
     'django.contrib.auth.backends.ModelBackend',

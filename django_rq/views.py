@@ -4,58 +4,35 @@ from math import ceil
 
 from django.contrib import messages
 from django.contrib.admin.views.decorators import staff_member_required
-from django.http import Http404
+from django.http import Http404, JsonResponse
 from django.shortcuts import redirect, render
 
 from redis.exceptions import ResponseError
-from rq import requeue_job, Worker
-from rq.exceptions import NoSuchJobError
+from rq import requeue_job
+from rq.exceptions import NoSuchJobError, UnpickleError
 from rq.job import Job
 from rq.registry import (DeferredJobRegistry, FinishedJobRegistry,
                          StartedJobRegistry)
+from rq.worker import Worker
 
-from .queues import get_connection, get_queue_by_index
-from .settings import QUEUES_LIST
+from .queues import get_queue_by_index
+from .settings import API_TOKEN
+from .utils import get_statistics
 
 
 @staff_member_required
 def stats(request):
-    queues = []
-    for index, config in enumerate(QUEUES_LIST):
+    return render(request, 'django_rq/stats.html', get_statistics())
 
-        queue = get_queue_by_index(index)
-        connection = queue.connection
 
-        queue_data = {
-            'name': queue.name,
-            'jobs': queue.count,
-            'index': index,
-            'connection_kwargs': connection.connection_pool.connection_kwargs
-        }
+def stats_json(request, token=None):
+    if request.user.is_staff or (token and token == API_TOKEN):
+        return JsonResponse(get_statistics())
 
-        if queue.name == 'failed':
-            queue_data['workers'] = '-'
-            queue_data['finished_jobs'] = '-'
-            queue_data['started_jobs'] = '-'
-            queue_data['deferred_jobs'] = '-'
-
-        else:
-            connection = get_connection(queue.name)
-            all_workers = Worker.all(connection=connection)
-            queue_workers = [worker for worker in all_workers if queue in worker.queues]
-            queue_data['workers'] = len(queue_workers)
-
-            finished_job_registry = FinishedJobRegistry(queue.name, connection)
-            started_job_registry = StartedJobRegistry(queue.name, connection)
-            deferred_job_registry = DeferredJobRegistry(queue.name, connection)
-            queue_data['finished_jobs'] = len(finished_job_registry)
-            queue_data['started_jobs'] = len(started_job_registry)
-            queue_data['deferred_jobs'] = len(deferred_job_registry)
-
-        queues.append(queue_data)
-
-    context_data = {'queues': queues}
-    return render(request, 'django_rq/stats.html', context_data)
+    return JsonResponse({
+        "error": True,
+        "description": "Please configure API_TOKEN in settings.py before accessing this view."
+    })
 
 
 @staff_member_required
@@ -167,6 +144,48 @@ def started_jobs(request, queue_index):
 
 
 @staff_member_required
+def workers(request, queue_index):
+    queue_index = int(queue_index)
+    queue = get_queue_by_index(queue_index)
+    all_workers = Worker.all(queue.connection)
+    workers = [worker for worker in all_workers
+               if queue.name in worker.queue_names()]
+
+    context_data = {
+        'queue': queue,
+        'queue_index': queue_index,
+        'workers': workers,
+    }
+    return render(request, 'django_rq/workers.html', context_data)
+
+
+@staff_member_required
+def worker_details(request, queue_index, key):
+    queue_index = int(queue_index)
+    queue = get_queue_by_index(queue_index)
+    worker = Worker.find_by_key(key, connection=queue.connection)
+
+    try:
+        # Convert microseconds to milliseconds
+        worker.total_working_time = worker.total_working_time / 1000
+    except AttributeError:
+        # older version of rq do not have `total_working_time`
+        worker.total_working_time = "-"
+
+    queue_names = ', '.join(worker.queue_names())
+
+    context_data = {
+        'queue': queue,
+        'queue_index': queue_index,
+        'worker': worker,
+        'queue_names': queue_names,
+        'job': worker.get_current_job(),
+        'total_working_time': worker.total_working_time * 1000
+    }
+    return render(request, 'django_rq/worker_details.html', context_data)
+
+
+@staff_member_required
 def deferred_jobs(request, queue_index):
     queue_index = int(queue_index)
     queue = get_queue_by_index(queue_index)
@@ -214,10 +233,17 @@ def job_detail(request, queue_index, job_id):
     except NoSuchJobError:
         raise Http404("Couldn't find job with this ID: %s" % job_id)
 
+    try:
+        job.func_name
+        data_is_valid = True
+    except UnpickleError:
+        data_is_valid = False
+
     context_data = {
         'queue_index': queue_index,
         'job': job,
         'queue': queue,
+        'data_is_valid': data_is_valid
     }
     return render(request, 'django_rq/job_detail.html', context_data)
 
@@ -289,20 +315,21 @@ def clear_queue(request, queue_index):
 def requeue_all(request, queue_index):
     queue_index = int(queue_index)
     queue = get_queue_by_index(queue_index)
-    jobs = queue.get_jobs()
 
     if request.method == 'POST':
-        # Confirmation received
-        for job in jobs:
-            requeue_job(job.id, connection=queue.connection)
+        job_ids = queue.get_job_ids()
 
-        messages.info(request, 'You have successfully requeued all %d jobs!' % len(jobs))
+        # Confirmation received
+        for job_id in job_ids:
+            requeue_job(job_id, connection=queue.connection)
+
+        messages.info(request, 'You have successfully requeued all %d jobs!' % len(job_ids))
         return redirect('rq_jobs', queue_index)
 
     context_data = {
         'queue_index': queue_index,
         'queue': queue,
-        'total_jobs':len(jobs),
+        'total_jobs': queue.count,
     }
 
     return render(request, 'django_rq/requeue_all.html', context_data)

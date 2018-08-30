@@ -1,3 +1,5 @@
+.DS_Store
+
 *.pyc
 *.sw*
 .env
@@ -5,3 +7,5 @@
 dist/
 django_rq.egg-info/
 
+# pycharm
+.idea
